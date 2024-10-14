@@ -1,5 +1,17 @@
 {
-  "name":"Cervitaur Template",
-  "authors":["cuRIOsity#8753 (Animations/Model Remaster)","KitCat#0962 (API Libraries / Templates)","Grandpa Scout#8739 (Blending Animation API)","Total Takeover#0042 (Combined Everything Together)","head empty#0999 (Antlers / Animation Handler)","??? (Ears)"],
-  "autoscripts":["script"]
+	"name": "Cervitaur",
+	"description": "\"Shikanoko Nokonoko Koshitantan.\"",
+	"authors": [
+		"Total",
+		"Curiosity",
+		"???",
+		"§f§nCredits§r",
+		"Jimmy",
+		"§f§nLibraries§r",
+		"Grandpa Scout (GSAnimBlend, GSCarrier)",
+		"Squishy (SquAPI)",
+		"Katt (OriginsAPI, KattArmor, DynamicCrosshair)",
+		"4P5 (GroundCheck)"
+	],
+	"version": "0.1.4"
 }
