@@ -6,15 +6,15 @@ local model = models.Cervitaur
 local modelRoot = model.Player
 
 --Register parts that act as armor
-local kattArmor = require("lib.KattArmor")
-kattArmor.Armor.Helmet:addParts(modelRoot.Head.Helmet.Helmet)
-kattArmor.Armor.Chestplate:addParts(
+local cervitaurArmor = require("lib.KattArmor")
+cervitaurArmor.Armor.Helmet:addParts(modelRoot.Head.Helmet.Helmet)
+cervitaurArmor.Armor.Chestplate:addParts(
   modelRoot.Body.Chestplate,
   modelRoot.Body.Merge.Chestplate,
   modelRoot.RightArm.RightChestplate,
   modelRoot.LeftArm.LeftChestplate
 )
-kattArmor.Armor.Leggings:setLayer(1):addParts(
+cervitaurArmor.Armor.Leggings:setLayer(1):addParts(
   modelRoot.Body.Merge.Leggings,
   modelRoot.Body.LeggingsBelt.Leggings,
   modelRoot.LowerBody.LowerBodyLeggings,
@@ -23,19 +23,19 @@ kattArmor.Armor.Leggings:setLayer(1):addParts(
   modelRoot.LowerBody.BackLeftLeg.BackLeftLeggings.Leggings,
   modelRoot.LowerBody.BackRightLeg.BackRightLeggings.Leggings
 )
-kattArmor.Armor.Boots:addParts(
+cervitaurArmor.Armor.Boots:addParts(
   modelRoot.LowerBody.FrontLeftLeg.FrontLeftLowerLeg.FrontLeftBoots.Boots,
   modelRoot.LowerBody.FrontRightLeg.FrontRightLowerLeg.FrontRightBoots.Boots,
   modelRoot.LowerBody.BackLeftLeg.BackLeftLowerLeg.BackLeftBoots.Boots,
   modelRoot.LowerBody.BackRightLeg.BackRightLowerLeg.BackRightBoots.Boots
 )
 
-kattArmor.Materials.leather
+cervitaurArmor.Materials.leather
     :setTexture(textures["textures.armor.leather"])
-    :addParts(kattArmor.Armor.Helmet,
+    :addParts(cervitaurArmor.Armor.Helmet,
       modelRoot.Head.Helmet.HelmetLeather
     )
-    :addParts(kattArmor.Armor.Leggings,
+    :addParts(cervitaurArmor.Armor.Leggings,
       modelRoot.Body.LeggingsBelt.LeggingsLeather,
       modelRoot.LowerBody.LowerBodyLeggingsLeather,
       modelRoot.LowerBody.FrontLeftLeg.FrontLeftLeggings.LeggingsLeather,
@@ -43,33 +43,33 @@ kattArmor.Materials.leather
       modelRoot.LowerBody.BackLeftLeg.BackLeftLeggings.LeggingsLeather,
       modelRoot.LowerBody.BackRightLeg.BackRightLeggings.LeggingsLeather
     )
-    :addParts(kattArmor.Armor.Boots,
+    :addParts(cervitaurArmor.Armor.Boots,
       modelRoot.LowerBody.FrontLeftLeg.FrontLeftLowerLeg.FrontLeftBoots.BootsLeather,
       modelRoot.LowerBody.FrontRightLeg.FrontRightLowerLeg.FrontRightBoots.BootsLeather,
       modelRoot.LowerBody.BackLeftLeg.BackLeftLowerLeg.BackLeftBoots.BootsLeather,
       modelRoot.LowerBody.BackRightLeg.BackRightLowerLeg.BackRightBoots.BootsLeather
     )
-kattArmor.Materials.chainmail:setTexture(textures["textures.armor.chainmail"])
-kattArmor.Materials.iron:setTexture(textures["textures.armor.iron"])
-kattArmor.Materials.golden:setTexture(textures["textures.armor.golden"])
-kattArmor.Materials.diamond:setTexture(textures["textures.armor.diamond"])
-kattArmor.Materials.netherite:setTexture(textures["textures.armor.netherite"])
-kattArmor.Materials.turtle:setTexture(textures["textures.armor.turtle"])
+cervitaurArmor.Materials.chainmail:setTexture(textures["textures.armor.chainmail"])
+cervitaurArmor.Materials.iron:setTexture(textures["textures.armor.iron"])
+cervitaurArmor.Materials.golden:setTexture(textures["textures.armor.golden"])
+cervitaurArmor.Materials.diamond:setTexture(textures["textures.armor.diamond"])
+cervitaurArmor.Materials.netherite:setTexture(textures["textures.armor.netherite"])
+cervitaurArmor.Materials.turtle:setTexture(textures["textures.armor.turtle"])
 
 local armorPage = action_wheel:newPage()
 
 local armorActions = {}
 pings["Katt$setArmorVisible"] = function(part, bool)
   if part ~= "All" then
-    kattArmor.Armor[part]:setMaterial(not bool or nil)
+    cervitaurArmor.Armor[part]:setMaterial(not bool or nil)
     return
   end
   for partID, action in pairs(armorActions) do
     action:toggled(bool)
-    kattArmor.Armor[partID]:setMaterial(not bool or nil)
+    cervitaurArmor.Armor[partID]:setMaterial(not bool or nil)
   end
 end
-for partID, _ in pairs(kattArmor.Armor) do
+for partID, _ in pairs(cervitaurArmor.Armor) do
   armorActions[partID] = armorPage:newAction()
       :toggled(true)
       :title("Toggle " .. partID)
