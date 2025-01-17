@@ -356,50 +356,35 @@ do
   end
 end
 
--- Set Lengths
-path.swim:setLength(1)
-
 require("lib.GSAnimBlend")
 
-path.idle:blendTime(4)
-path.walk:blendTime(8)
-path.walkback:blendTime(8)
-path.sprint:blendTime(4)
-path.lean:blendTime(4)
-path.crouch:blendTime(4)
-path.crouchwalk:blendTime(4)
-path.crouchwalkback:blendTime(4)
-path.jumpup:blendTime(6)
-path.jumpdown:blendTime(6)
-path.elytra:blendTime(4)
-path.vehicle:blendTime(10)
-path.sleep:blendTime(10)
-path.climb:blendTime(8)
-path.swim:blendTime(10)
-path.crawl:blendTime(4)
-path.crawlstill:blendTime(4)
-path.trident:blendTime(8)
-path.fly:blendTime(10)
+-- GS Blending Setup
+local blendAnims = {
+	{ anim = path.idle,           ticks = {4,4}   },
+	{ anim = path.walk,           ticks = {8,8}   },
+	{ anim = path.walkback,       ticks = {8,8}   },
+	{ anim = path.sprint,         ticks = {4,4}   },
+	{ anim = path.lean,           ticks = {4,4}   },
+	{ anim = path.crouch,         ticks = {4,4}   },
+	{ anim = path.crouchwalk,     ticks = {4,4}   },
+	{ anim = path.crouchwalkback, ticks = {4,4}   },
+	{ anim = path.jumpup,         ticks = {6,6}   },
+	{ anim = path.jumpdown,       ticks = {6,6}   },
+	{ anim = path.elytra,         ticks = {4,4}   },
+	{ anim = path.vehicle,        ticks = {10,10} },
+	{ anim = path.sleep,          ticks = {10,10} },
+	{ anim = path.climb,          ticks = {8,8}   },
+	{ anim = path.swim,           ticks = {10,10} },
+	{ anim = path.crawl,          ticks = {4,4}   },
+	{ anim = path.crawlstill,     ticks = {4,4}   },
+	{ anim = path.trident,        ticks = {8,8}   },
+	{ anim = path.fly,            ticks = {10,10} }
+}
 
-path.idle:onBlend("easeOutQuad")
-path.walk:onBlend("easeOutQuad")
-path.walkback:onBlend("easeOutQuad")
-path.sprint:onBlend("easeOutQuad")
-path.lean:onBlend("easeOutQuad")
-path.crouch:onBlend("easeOutQuad")
-path.crouchwalk:onBlend("easeOutQuad")
-path.crouchwalkback:onBlend("easeOutQuad")
-path.jumpup:onBlend("easeOutQuad")
-path.jumpdown:onBlend("easeOutQuad")
-path.elytra:onBlend("easeOutQuad")
-path.vehicle:onBlend("easeOutQuad")
-path.sleep:onBlend("easeOutQuad")
-path.climb:onBlend("easeOutQuad")
-path.swim:onBlend("easeOutQuad")
-path.crawl:onBlend("easeOutQuad")
-path.crawlstill:onBlend("easeOutQuad")
-path.trident:onBlend("easeOutQuad")
-path.fly:onBlend("easeOutQuad")
+-- Apply GS Blending
+for _, blend in ipairs(blendAnims) do
+	blend.anim:blendTime(table.unpack(blend.ticks)):blendCurve("easeOutQuad")
+end
 
 -- If you're choosing to edit this script, don't put anything beneath the return line
 
