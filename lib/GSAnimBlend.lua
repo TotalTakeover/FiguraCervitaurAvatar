@@ -6,21 +6,34 @@
 -- │ └─┐ └─────┘└─────┘ ┌─┘ │ --
 -- └───┘                └───┘ --
 ---@module  "Animation Blending Library" <GSAnimBlend>
----@version v1.9.10
+---@version v2.2.1
 ---@see     GrandpaScout @ https://github.com/GrandpaScout
 -- Adds prewrite-like animation blending to the rewrite.
 -- Also includes the ability to modify how the blending works per-animation with blending callbacks.
 --
--- Simply `require`ing this library is enough to make it run. However, if you place this library in
--- a variable, you can get access to functions and tools that allow for generating pre-build blend
--- callbacks or creating your own blend callbacks.
+-- Simply `require`ing this library is enough to make it run. However, if you place this library in a variable, you can
+-- get access to functions and tools that allow for generating built-in blending callbacks or creating your own blending
+-- callbacks.
 --
--- This library is fully documented. If you use Sumneko's Lua Language server, you will get
--- descriptions of each function, method, and field in this library.
+-- This library is fully documented. If you use Sumneko's Lua Language server, you will get descriptions of each
+-- function, method, and field in this library.
 
 local ID = "GSAnimBlend"
-local VER = "1.9.10"
-local FIG = {"0.1.0-rc.14", "0.1.4"}
+local VER = "2.2.1"
+local FIG = {"0.1.0-rc.14", "0.1.5"}
+
+-- Safe version comparison --
+local CLIENT_VERSION = client.getFiguraVersion()
+    :match("^([^%+]*)")
+    :gsub("^([pr])", "0.1.3-%1")
+local COMPARABLE_VERSION = CLIENT_VERSION
+  :gsub("^(%d+).-%..-(%d+).-%..-(%d+).-(%-?)", "%1.%2.%3%4")
+
+local cmp = function(to)
+  local s, r = pcall(client.compareVersions, COMPARABLE_VERSION, to)
+  return s and r or nil
+end
+-----------------------------
 
 ---@type boolean, Lib.GS.AnimBlend
 local s, this = pcall(function()
@@ -39,7 +52,8 @@ local s, this = pcall(function()
   local pairs = pairs
   local rawset = rawset
   local tostring = tostring
-  -- Localize Lua math
+  -- Localize Lua libraries
+  local math = math
   local m_abs = math.abs
   local m_cos = math.cos
   local m_lerp = math.lerp
@@ -47,11 +61,11 @@ local s, this = pcall(function()
   local m_max = math.max
   local m_sin = math.sin
   local m_sqrt = math.sqrt
-  local m_huge = math.huge
   local m_pi = math.pi
   local m_1s2pi = m_pi * 0.5
   local m_2s3pi = m_pi / 1.5
   local m_4s9pi = m_pi / 2.25
+  local t_remove = table.remove
   -- Localize Figura globals
   local animations = animations
   local figuraMetatables = figuraMetatables
@@ -108,6 +122,7 @@ local s, this = pcall(function()
   -----======================================= VARIABLES ========================================-----
 
   local _ENVMT = getmetatable(_ENV)
+
 
   ---Contains the data required to make animation blending for each animation.
   ---@type {[Animation]: Lib.GS.AnimBlend.AnimData}
@@ -169,7 +184,7 @@ local s, this = pcall(function()
     elseif type(got) ~= "number" then
       local gotType = chk.types[type(got)] or "userdata"
       return false, ("bad argument #%s to '%s' (number expected, got %s)"):format(i, name, gotType)
-    elseif got ~= got or m_abs(got) == m_huge then
+    elseif got * 0 ~= 0 then
       return false, ("bad argument #%s to '%s' (value cannot be %s)"):format(i, name, got)
     end
 
@@ -177,47 +192,83 @@ local s, this = pcall(function()
   end
 
   local function makeSane(val, def)
-    return (val == val and m_abs(val) ~= m_huge) and val or def
+    return val * 0 == 0 and val or def
   end
 
 
   -----=================================== PREPARE ANIMATIONS ===================================-----
 
-  -- This will at least catch players running at around 30 fps.
-  -- Any lower and their computer is already having trouble, they don't need the blending.
-  local tPass = 0.037504655
+  local animPause
+  local blendCommand = [[getmetatable(_ENV).GSLib_triggerBlend[%d](%s, ...)]]
 
-  local blendCommand = [[getmetatable(_ENV).GSLib_triggerBlend(%q)]]
+  _ENVMT.GSLib_triggerBlend = {}
 
-  _ENVMT.GSLib_triggerBlend = setmetatable({}, {
-    __call = function(self, id)
-      if self[id] then self[id]() end
+  local anim_nbt = avatar:getNBT().animations
+  if anim_nbt then
+    for i, nbt in ipairs(anim_nbt) do
+      ---@type Animation
+      local anim = animations[nbt.mdl][nbt.name]
+      local blend = anim:getBlend()
+      local len = anim:getLength()
+      local lenSane = makeSane(len, false)
+
+      ---@type function?, function?
+      local start_func, end_func
+      ---@type string?, string?
+      local start_src, end_src
+      if nbt.code then
+        for _, code in ipairs(nbt.code) do
+          if code.time == 0 then
+            start_src = code.src
+            start_func = load(start_src, ("animations.%s.%s"):format(nbt.mdl, nbt.name))
+          elseif code.time == len then
+            end_src = code.src
+            end_func = load(end_src, ("animations.%s.%s"):format(nbt.mdl, nbt.name))
+          end
+          if start_func and (len == 0 or end_func) then break end
+        end
+      end
+
+      animData[anim] = {
+        blendTimeIn = 0,
+        blendTimeOut = 0,
+        blend = blend,
+        blendSane = makeSane(blend, 0),
+        length = lenSane,
+        triggerId = i,
+        callbacks = {},
+        callbacksCache = {priority_0 = 1, use_default = true},
+        model = nbt.mdl,
+        startFunc = start_func,
+        startSource = start_src,
+        endFunc = end_func,
+        endSource = end_src
+      }
+
+      _ENVMT.GSLib_triggerBlend[i] = function(at_start, ...)
+        if
+          anim:getLoop() == "ONCE"
+          and (animData[...].blendTimeOut > 0)
+          and (at_start == nil or (anim:getSpeed() < 0) == at_start)
+        then
+          animPause(anim)
+          anim:stop()
+        end
+        local data = animData[anim]
+        if at_start == false then
+          if data.endFunc then data.endFunc(...) end
+        elseif data.startFunc then
+          data.startFunc(...)
+        end
+      end
+
+      if lenSane == 0 then
+        anim:newCode(0, blendCommand:format(i, "nil"))
+      else
+        anim:newCode(0, blendCommand:format(i, "true"))
+        if lenSane then anim:newCode(lenSane, blendCommand:format(i, "false")) end
+      end
     end
-  })
-
-  local animNum = 0
-  for _, anim in ipairs(animations:getAnimations()) do
-    local blend = anim:getBlend()
-    local len = anim:getLength()
-    local lenSane = makeSane(len, false)
-    lenSane = lenSane and (lenSane > tPass and lenSane) or false
-    local tID = "blendAnim_" .. animNum
-
-    animData[anim] = {
-      blendTimeIn = 0,
-      blendTimeOut = 0,
-      blend = blend,
-      blendSane = makeSane(blend, 0),
-      length = lenSane,
-      triggerId = tID,
-      callback = nil
-    }
-
-    _ENVMT.GSLib_triggerBlend[tID] = function() if anim:getLoop() == "ONCE" then anim:stop() end end
-
-    if lenSane then anim:newCode(m_max(lenSane - tPass, 0), blendCommand:format(tID)) end
-
-    animNum = animNum + 1
   end
 
 
@@ -237,11 +288,12 @@ local s, this = pcall(function()
 
 
   -- Check for conflicts
-  if ext_Animation.blendTime then
-    local path = tostring(ext_Animation.blendTime):match("^function: (.-):%d+%-%d+$")
+  if ext_Animation.setBlendTime or ext_Animation.blendTime then
+    local this_path = tostring(makeSane):match("^function: (.-):%d+%-%d+$")
+    local other_path = tostring(ext_Animation.setBlendTime or ext_Animation.blendTime):match("^function: (.-):%d+%-%d+$")
     error(
-      "Conflicting script [" .. path .. "] found!\n" ..
-      "Remove the other script or this script to fix the error."
+      ("Conflict found!\n§7[§e%s.lua§7]§4 conflicts with §7[§e%s.lua§7]§4\nRemove one of the above scripts to fix this conflict.")
+        :format(this_path, other_path)
     )
   end
 
@@ -251,15 +303,17 @@ local s, this = pcall(function()
 
   local animPlay = ext_Animation.play
   local animStop = ext_Animation.stop
-  local animPause = ext_Animation.pause
+  animPause = ext_Animation.pause
   local animRestart = ext_Animation.restart
   local animBlend = ext_Animation.blend
   local animLength = ext_Animation.length
   local animGetPlayState = ext_Animation.getPlayState
   local animGetBlend = ext_Animation.getBlend
+  local animGetTime = ext_Animation.getTime
   local animIsPlaying = ext_Animation.isPlaying
   local animIsPaused = ext_Animation.isPaused
   local animNewCode = ext_Animation.newCode
+  local animPlaying = ext_Animation.playing
   local animapiGetPlaying = animations.getPlaying
 
   ---Contains the old functions, just in case you need direct access to them again.
@@ -273,6 +327,7 @@ local s, this = pcall(function()
 
     getBlend = animGetBlend,
     getPlayState = animGetPlayState,
+    getTime = animGetTime,
     isPlaying = animIsPlaying,
     isPaused = animIsPaused,
 
@@ -282,7 +337,7 @@ local s, this = pcall(function()
 
     blend = animBlend,
     length = animLength,
-    playing = ext_Animation.playing,
+    playing = animPlaying,
 
     api_getPlaying = animapiGetPlaying
   }
@@ -290,7 +345,8 @@ local s, this = pcall(function()
 
   -----===================================== SET UP LIBRARY =====================================-----
 
-  ---Causes a blending event to happen.
+  ---Causes a blending event to happen and returns the blending state for that event.  
+  ---If a blending event could not happen for some reason, nothing will be returned.
   ---
   ---If `time`, `from`, or `to` are `nil`, they will take from the animation's data to determine this
   ---value.
@@ -303,7 +359,7 @@ local s, this = pcall(function()
   ---@param from? number
   ---@param to? number
   ---@param starting? boolean
-  ---@return Lib.GS.AnimBlend.BlendState
+  ---@return Lib.GS.AnimBlend.BlendState?
   function this.blend(anim, time, from, to, starting)
     if this.safe then
       assert(chk.badarg(1, "blend", anim, "Animation"))
@@ -320,6 +376,21 @@ local s, this = pcall(function()
       starting = (from or blendSane) < (to or blendSane)
     end
 
+    if not player:isLoaded() then
+      if starting then
+        animPlay(anim)
+      else
+        animStop(anim)
+      end
+      return nil
+    end
+
+    local callbacks_cache = data.callbacksCache
+    if callbacks_cache.use_default then
+      callbacks_cache[callbacks_cache.priority_0] = this.defaultCallback
+    end
+
+
     data.state = {
       time = 0,
       max = time or false,
@@ -327,16 +398,19 @@ local s, this = pcall(function()
       from = from or false,
       to = to or false,
 
-      callback = data.callback or this.defaultCallback,
+      callbacks = callbacks_cache,
+      curve = data.curve or this.defaultCurve,
 
       paused = false,
       starting = starting,
+      delay = starting and m_max(anim:getStartDelay() * 20, 0) or 0,
 
       callbackState = {
         anim = anim,
         time = 0,
         max = time or (starting and data.blendTimeIn or data.blendTimeOut),
         progress = 0,
+        rawProgress = 0,
         from = from or blendSane,
         to = to or blendSane,
         starting = starting,
@@ -347,30 +421,76 @@ local s, this = pcall(function()
     blending[anim] = true
 
     animBlend(anim, from or blendSane)
-    animPlay(anim)
-    if starting then anim:setTime(anim:getOffset()) end
+    if starting then
+      animPlay(anim)
+      if anim:getSpeed() < 0 then
+        anim:setTime(anim:getLength() - anim:getOffset())
+      else
+        anim:setTime(anim:getOffset())
+      end
+    end
     animPause(anim)
 
-    return blendState
+    return data.state
+  end
+
+  ---A helper function that immediately stops a running blend on an animation.  
+  ---This function will do nothing if the animation is not blending.
+  ---
+  ---A blend stopped with this function will run its blending callback one final time to request cleanup and then
+  ---complete the blend.
+  ---
+  ---If `starting` is not `nil`, it will override the blending state's `starting` field when determining what happens
+  ---after the blend is stopped.
+  ---@param anim Animation
+  ---@param starting? boolean
+  function this.stopBlend(anim, starting)
+    if this.safe then
+      assert(chk.badarg(1, "stopBlend", anim, "Animation"))
+    end
+
+    if blending[anim] then
+      local data = animData[anim]
+      local state = data.state
+      local cbs = state.callbackState
+      cbs.progress = 1
+      cbs.time = cbs.max
+      cbs.done = true
+      for _, cb in ipairs(state.callbacks) do cb(cbs, data) end
+      blending[anim] = nil
+      animBlend(anim, data.blend)
+
+      if starting ~= nil then
+        (starting and animPlay or animStop)(anim)
+      else
+        (state.starting and animPlay or animStop)(anim)
+      end
+    end
   end
 
 
   -----==================================== PRESET CALLBACKS ====================================-----
 
-  ---Contains blending callback generators.
+  ---Contains blending callbacks and callback generators.
   ---
-  ---These are *not* callbacks themselves. They are meant to be called to generate a callback which
-  ---can *then* be used.
-  local callbackGenerators = {}
+  ---Callback generators are *not* callbacks themselves. They are meant to be called to generate a callback which can
+  ---*then* be used.
+  local callbackFunction = {}
 
   ---Contains custom blending curves.
   ---
-  ---These callbacks change the curve used when blending. These cannot be used to modify custom or
-  ---generated callbacks (yet).
-  local callbackCurves = {}
+  ---These callbacks change the easing curve used when blending.
+  local easingCurve = {}
 
 
-  ---===== CALLBACK GENERATORS =====---
+  ---===== CALLBACK FUNCTIONS =====---
+
+  ---The base blending callback used by GSAnimBlend.  
+  ---Does the bare minimum of setting the blend weight of the animation to match the blend progress.
+  ---@param state Lib.GS.AnimBlend.CallbackState
+  function callbackFunction.base(state)
+    animBlend(state.anim, m_lerp(state.from, state.to, state.progress))
+  end
 
   ---Given a list of parts, this will generate a blending callback that will blend between the vanilla
   ---parts' normal rotations and the rotations of the animation.
@@ -384,43 +504,47 @@ local s, this = pcall(function()
   ---code that also uses that method!
   ---@param parts ModelPart[]
   ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.blendVanilla(parts)
+  function callbackFunction.genBlendVanilla(parts)
     -- Because some dumbass won't read the instructions...
     ---@diagnostic disable-next-line: undefined-field
     if parts.done ~= nil then
-      error("attempt to use generator 'blendVanilla' as a blend callback.", 2)
+      error("attempt to use generator 'genBlendVanilla' as a blend callback.", 2)
+    end
+
+    if this.safe then
+      for i, part in ipairs(parts) do
+        assert(chk.badarg("1[" .. i .. "]", "genBlendVanilla", part, "ModelPart"))
+      end
     end
 
     ---@type {[string]: ModelPart[]}
-    local partList = {}
+    local part_list = {}
+    local partscopy = {}
 
     -- Gather the vanilla parent of each part.
-    for _, part in ipairs(parts) do
+    for i, part in ipairs(parts) do
+      partscopy[i] = part
       local vpart = part:getParentType():gsub("([a-z])([A-Z])", "%1_%2"):upper()
       if vanilla_model[vpart] then
-        if not partList[vpart] then partList[vpart] = {} end
-        local plvp = partList[vpart]
+        if not part_list[vpart] then part_list[vpart] = {} end
+        local plvp = part_list[vpart]
         plvp[#plvp+1] = part
       end
     end
 
     -- The actual callback is created here.
-    return function(state, data)
+    return function(state)
       if state.done then
-        (state.starting and animPlay or animStop)(state.anim)
         local id = "GSAnimBlend:BlendVanillaCleanup_" .. math.random(0, 0xFFFF)
         events.POST_RENDER:register(function(_, ctx)
           if not allowed_contexts[ctx] then return end
-          for _, v in pairs(partList) do
-            for _, p in ipairs(v) do p:offsetRot() end
-          end
+          for _, part in ipairs(partscopy) do part:offsetRot() end
           events.POST_RENDER:remove(id)
         end, id)
-        animBlend(state.anim, data.blend)
       else
         local pct = state.starting and 1 - state.progress or state.progress
 
-        for n, v in pairs(partList) do
+        for n, v in pairs(part_list) do
           ---@type Vector3
           local rot = vanilla_model[n]:getOriginRot()
           if n == "HEAD" then rot[2] = ((rot[2] + 180) % 360) - 180 end
@@ -436,11 +560,15 @@ local s, this = pcall(function()
   ---Generates a callback that causes an animation to blend into another animation.
   ---@param anim Animation
   ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.blendTo(anim)
+  function callbackFunction.genBlendTo(anim)
     -- Because some dumbass won't read the instructions...
     ---@diagnostic disable-next-line: undefined-field
     if anim.done ~= nil then
-      error("attempt to use generator 'blendTo' as a blend callback.", 2)
+      error("attempt to use generator 'genBlendTo' as a blend callback.", 2)
+    end
+
+    if this.safe then
+      assert(chk.badarg(1, "genBlendTo", anim, "Animation"))
     end
 
     ---This is used to track when the next animation should start blending.
@@ -448,8 +576,6 @@ local s, this = pcall(function()
 
     return function(state, data)
       if state.done then
-        (state.starting and animPlay or animStop)(state.anim)
-        animBlend(state.anim, data.blend)
         ready = true
       else
         if not state.starting and ready then
@@ -464,19 +590,23 @@ local s, this = pcall(function()
   ---Generates a callback that forces all given animations to blend out if they are playing.
   ---@param anims Animation[]
   ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.blendOut(anims)
+  function callbackFunction.genBlendOut(anims)
     -- Because some dumbass won't read the instructions...
     ---@diagnostic disable-next-line: undefined-field
-    if anim.done ~= nil then
-      error("attempt to use generator 'blendOut' as a blend callback.", 2)
+    if anims.done ~= nil then
+      error("attempt to use generator 'genBlendOut' as a blend callback.", 2)
+    end
+
+    if this.safe then
+      for i, anim in ipairs(anims) do
+        assert(chk.badarg("1[" .. i .. "]", "genBlendOut", anim, "Animation"))
+      end
     end
 
     local ready = true
 
-    return function(state, data)
+    return function(state)
       if state.done then
-        (state.starting and animPlay or animStop)(state.anim)
-        animBlend(state.anim, data.blend)
         ready = true
       else
         if state.starting and ready then
@@ -488,82 +618,367 @@ local s, this = pcall(function()
     end
   end
 
-  ---Generates a makeshift blending callback by using the return value of the given function as the progress.
-  ---
-  ---The current progress is passed into the function.
-  ---@param func fun(progress: number): number
-  ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.custom(func)
-    -- Because some dumbass won't read the instructions...
-    ---@diagnostic disable-next-line: undefined-field
-    if type(func) == "table" and func.done ~= nil then
-      error("attempt to use generator 'custom' as a blend callback.", 2)
-    end
-
-    return function(state, data)
-      if state.done then
-        (state.starting and animPlay or animStop)(state.anim)
-        animBlend(state.anim, data.blend)
-      else
-        animBlend(state.anim, m_lerp(state.from, state.to, func(state.progress)))
-      end
-    end
-  end
-
   ---Generates a callback that plays one callback while blending in and another callback while blending out.
   ---
-  ---If a string is given instead of a callback, it is treated as the name of a curve found in
-  ---`<GSAnimBlend>.callbackCurves`.  
   ---If `nil` is given, the default callback is used.
-  ---@param blend_in? Lib.GS.AnimBlend.blendCallback | Lib.GS.AnimBlend.curve
-  ---@param blend_out? Lib.GS.AnimBlend.blendCallback | Lib.GS.AnimBlend.curve
+  ---@param blend_in? Lib.GS.AnimBlend.blendCallback
+  ---@param blend_out? Lib.GS.AnimBlend.blendCallback
   ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.dualBlend(blend_in, blend_out)
+  function callbackFunction.genDualBlend(blend_in, blend_out)
     -- The dumbass check is a bit further down.
 
     local tbin, tbout = type(blend_in), type(blend_out)
     local infunc, outfunc = blend_in, blend_out
-    if tbin == "string" then
-      infunc = callbackCurves[blend_in]
-      if not infunc then error("bad argument #1 to 'dualBlend' ('" .. blend_in .. "' is not a valid curve)", 2) end
-    elseif blend_in == nil then
-      infunc = this.defaultCallback
-    elseif tbin == "table" then
+    if tbin == "table" then
       -- Because some dumbass won't read the instructions...
       ---@diagnostic disable-next-line: undefined-field
       if blend_in.done ~= nil then
-        error("attempt to use generator 'dualBlend' as a blend callback.", 2)
+        error("attempt to use generator 'genDualBlend' as a blend callback.", 2)
       end
       local mt = getmetatable(blend_in)
       if not (mt and mt.__call) then
-        error("bad argument #1 to 'dualBlend' (function or string expected, got " .. tbin .. ")")
+        error("bad argument #1 to 'genDualBlend' (function expected, got " .. tbin .. ")")
       end
-    elseif tbin ~= "function" then
-      error("bad argument #1 to 'dualBlend' (function or string expected, got " .. tbin .. ")")
+    else
+      assert(chk.badarg(1, "genDualBlend", blend_in, "function", true))
     end
 
-    if tbout == "string" then
-      outfunc = callbackCurves[blend_out]
-      if not outfunc then error("bad argument #2 to 'dualBlend' ('" .. blend_in .. "' is not a valid curve)", 2) end
-    elseif blend_out == nil then
-      outfunc = this.defaultCallback
-    elseif tbout == "table" then
+    if tbout == "table" then
       local mt = getmetatable(blend_out)
       if not (mt and mt.__call) then
-        error("bad argument #2 to 'dualBlend' (function or string expected, got " .. tbin .. ")")
+        error("bad argument #2 to 'genDualBlend' (function expected, got " .. tbin .. ")")
       end
-    elseif tbout ~= "function" then
-      error("bad argument #2 to 'dualBlend' (function or string expected, got " .. tbout .. ")")
+    else
+      assert(chk.badarg(2, "genDualBlend", blend_out, "function", true))
     end
 
     return function(state, data)
-      if state.starting then
-        infunc(state, data)
-      else
-        outfunc(state, data)
-      end
+      (state.starting and (infunc or this.defaultCallback) or (outfunc or this.defaultCallback))(state, data)
     end
   end
+
+  ---Generates a callback that plays other callbacks on a timeline.
+  ---
+  ---Callbacks generated by this function *ignore easing curves in favor of the curves provided by the timeline*.
+  ---
+  ---An example of a valid timeline:
+  ---```lua
+  ---...genTimeline({
+  ---  {time = 0, min = 0, max = 1, curve = "easeInSine"},
+  ---  {time = 0.25, min = 1, max = 0.5, curve = "easeOutCubic"},
+  ---  {time = 0.8, min = 0.5, max = 1, curve = "easeInCubic"}
+  ---})
+  ---```
+  ---@param tl Lib.GS.AnimBlend.timeline
+  ---@return Lib.GS.AnimBlend.blendCallback
+  function callbackFunction.genTimeline(tl)
+    -- Because some dumbass won't read the instructions...
+    ---@diagnostic disable-next-line: undefined-field
+    if tl.done ~= nil then
+      error("attempt to use generator 'genTimeline' as a blend callback.", 2)
+    end
+
+    if this.safe then
+      assert(chk.badarg(1, "genTimeline", tl, "table"))
+      for i, kf in ipairs(tl) do
+        assert(chk.badarg("1[" .. i .. "]", "genTimeline", kf, "table"))
+      end
+      local time = 0
+      local ftime = tl[1].time
+      if ftime ~= 0 then error("error in keyframe #1: timeline does not start at 0 (got " .. ftime .. ")") end
+      for i, kf in ipairs(tl) do
+        assert(chk.badnum("1[" .. i .. ']["time"]', "genTimeline", kf.time))
+        if kf.time <= time then
+          error(
+            "error in keyframe #" .. i ..
+            ": timeline did not move forward (from " .. time .. " to " .. kf.time .. ")", 2
+          )
+        end
+
+        if kf.min then assert(chk.badnum("1[" .. i .. ']["min"]', "genTimeline", kf.min)) end
+        if kf.max then assert(chk.badnum("1[" .. i .. ']["max"]', "genTimeline", kf.max)) end
+
+        assert(chk.badarg("1[" .. i .. ']["callback"]', "genTimeline", kf.callback, "function", true))
+        if type(kf.curve) ~= "string" then
+          assert(chk.badarg("1[" .. i .. ']["curve"]', "genTimeline", kf.curve, "function", true))
+        elseif not easingCurve[kf.curve] then
+          error("bad argument 1[" .. i .. "][\"curve\"] of 'genTimeline' ('" .. kf.curve .. "' is not a valid curve)")
+        end
+      end
+    end
+
+    for _, kf in ipairs(tl) do
+      if type(kf.curve) == "string" then
+        kf.curve = easingCurve[kf.curve]
+      end
+    end
+
+    return function(state, data)
+      ---@type Lib.GS.AnimBlend.tlKeyframe, Lib.GS.AnimBlend.tlKeyframe
+      local kf, nextkf
+      for _, _kf in ipairs(tl) do
+        if _kf.time > state.rawProgress then
+          if _kf.time < 1 then nextkf = _kf end
+          break
+        end
+        kf = _kf
+      end
+
+      local adj_prog = m_map(
+        state.rawProgress,
+        kf.time, nextkf and nextkf.time or 1,
+        kf.min or 0, kf.max or 1
+      )
+
+      local newstate = setmetatable(
+        {time = state.max * adj_prog, progress = (kf.curve or this.defaultCurve)(adj_prog)},
+        {__index = state}
+      );
+      (kf.callback or this.defaultCallback)(newstate, data)
+    end
+  end
+
+
+  ---===== EASING CURVES =====---
+
+  ---The `linear` easing curve.
+  ---
+  ---This is the default curve used by GSAnimBlend.
+  ---@param x number
+  ---@return number
+  function easingCurve.linear(x) return x end
+
+  ---The `smoothstep` easing curve.
+  ---
+  ---This is a more performant, but slightly less accurate version of `easeInOutSine`.
+  ---@param x number
+  ---@return number
+  function easingCurve.smoothstep(x) return x^2 * (3 - 2 * x) end
+
+  -- I planned to add easeOutIn curves but I'm lazy. I'll do it if people request it.
+
+  ---The [`easeInSine`](https://easings.net/#easeInSine) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInSine(x) return 1 - m_cos(x * m_1s2pi) end
+
+  ---The [`easeOutSine`](https://easings.net/#easeOutSine) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutSine(x) return m_sin(x * m_1s2pi) end
+
+  ---The [`easeInOutSine`](https://easings.net/#easeInOutSine) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutSine(x) return (m_cos(x * m_pi) - 1) * -0.5 end
+
+  ---The [`easeInQuad`](https://easings.net/#easeInQuad) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInQuad(x) return x^2 end
+
+  ---The [`easeOutQuad`](https://easings.net/#easeOutQuad) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutQuad(x) return 1 - (1 - x)^2 end
+
+  ---The [`easeInOutQuad`](https://easings.net/#easeInOutQuad) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutQuad(x)
+    return x < 0.5
+      and 2 * x^2
+      or 1 - (-2 * x + 2)^2 * 0.5
+  end
+
+  ---The [`easeInCubic`](https://easings.net/#easeInCubic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInCubic(x) return x^3 end
+
+  ---The [`easeOutCubic`](https://easings.net/#easeOutCubic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutCubic(x) return 1 - (1 - x)^3 end
+
+  ---The [`easeInOutCubic`](https://easings.net/#easeInOutCubic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutCubic(x)
+    return x < 0.5
+      and 4 * x^3
+      or 1 - (-2 * x + 2)^3 * 0.5
+  end
+
+  ---The [`easeInQuart`](https://easings.net/#easeInQuart) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInQuart(x) return x^4 end
+
+  ---The [`easeOutQuart`](https://easings.net/#easeOutQuart) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutQuart(x) return 1 - (1 - x)^4 end
+
+  ---The [`easeInOutQuart`](https://easings.net/#easeInOutQuart) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutQuart(x)
+    return x < 0.5
+      and 8 * x^4
+      or 1 - (-2 * x + 2)^4 * 0.5
+  end
+
+  ---The [`easeInQuint`](https://easings.net/#easeInQuint) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInQuint(x) return x^5 end
+
+  ---The [`easeOutQuint`](https://easings.net/#easeOutQuint) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutQuint(x) return 1 - (1 - x)^5 end
+
+  ---The [`easeInOutQuint`](https://easings.net/#easeInOutQuint) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutQuint(x)
+    return x < 0.5
+      and 16 * x^5
+      or 1 - (-2 * x + 2)^5 * 0.5
+  end
+
+  ---The [`easeInExpo`](https://easings.net/#easeInExpo) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInExpo(x)
+    return x == 0
+      and 0
+      or 2^(10 * x - 10)
+  end
+
+  ---The [`easeOutExpo`](https://easings.net/#easeOutExpo) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutExpo(x)
+    return x == 1
+      and 1
+      or 1 - 2^(-10 * x)
+  end
+
+  ---The [`easeInOutExpo`](https://easings.net/#easeInOutExpo) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutExpo(x)
+    return (x == 0 or x == 1) and x
+      or x < 0.5 and 2^(20 * x - 10) * 0.5
+      or (2 - 2^(-20 * x + 10)) * 0.5
+  end
+
+  ---The [`easeInCirc`](https://easings.net/#easeInCirc) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInCirc(x) return 1 - m_sqrt(1 - x^2) end
+
+  ---The [`easeOutCirc`](https://easings.net/#easeOutCirc) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutCirc(x) return m_sqrt(1 - (x - 1)^2) end
+
+  ---The [`easeInOutCirc`](https://easings.net/#easeInOutCirc) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutCirc(x)
+    return x < 0.5
+      and (1 - m_sqrt(1 - (2 * x)^2)) * 0.5
+      or (m_sqrt(1 - (-2 * x + 2)^2) + 1) * 0.5
+  end
+
+  ---The [`easeInBack`](https://easings.net/#easeInBack) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInBack(x) return 2.70158 * x^3 - 1.70158 * x^2 end
+
+  ---The [`easeOutBack`](https://easings.net/#easeOutBack) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutBack(x)
+    x = x - 1
+    return 1 + 2.70158 * x^3 + 1.70158 * x^2
+  end
+
+  ---The [`easeInOutBack`](https://easings.net/#easeInOutBack) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutBack(x)
+    x = x * 2
+    return x < 1
+      and (x^2 * (3.5949095 * x - 2.5949095)) * 0.5
+      or ((x - 2)^2 * (3.5949095 * (x - 2) + 2.5949095) + 2) * 0.5
+  end
+
+  ---The [`easeInElastic`](https://easings.net/#easeInElastic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInElastic(x)
+    return (x == 0 or x == 1) and x
+      or -(2^(10 * x - 10)) * m_sin((x * 10 - 10.75) * m_2s3pi)
+  end
+
+  ---The [`easeOutElastic`](https://easings.net/#easeOutElastic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutElastic(x)
+    return (x == 0 or x == 1) and x
+      or 2^(-10 * x) * m_sin((x * 10 - 0.75) * m_2s3pi) + 1
+  end
+
+  ---The [`easeInOutElastic`](https://easings.net/#easeInOutElastic) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutElastic(x)
+    return (x == 0 or x == 1) and x
+      or x < 0.5 and -(2^(x * 20 - 10) * m_sin((x * 20 - 11.125) * m_4s9pi)) * 0.5
+      or (2^(x * -20 + 10) * m_sin((x * 20 - 11.125) * m_4s9pi)) * 0.5 + 1
+  end
+
+  ---The [`easeInBounce`](https://easings.net/#easeInBounce) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInBounce(x)
+    x = 1 - x
+    return 1 - (
+      x < (1 / 2.75) and 7.5625 * x^2
+      or x < (2 / 2.75) and 7.5625 * (x - 1.5 / 2.75)^2 + 0.75
+      or x < (2.5 / 2.75) and 7.5625 * (x - 2.25 / 2.75)^2 + 0.9375
+      or 7.5625 * (x - 2.625 / 2.75)^2 + 0.984375
+    )
+  end
+
+  ---The [`easeOutBounce`](https://easings.net/#easeOutBounce) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeOutBounce(x)
+    return x < (1 / 2.75) and 7.5625 * x^2
+      or x < (2 / 2.75) and 7.5625 * (x - 1.5 / 2.75)^2 + 0.75
+      or x < (2.5 / 2.75) and 7.5625 * (x - 2.25 / 2.75)^2 + 0.9375
+      or 7.5625 * (x - 2.625 / 2.75)^2 + 0.984375
+  end
+
+  ---The [`easeInOutBounce`](https://easings.net/#easeInOutBounce) easing curve.
+  ---@param x number
+  ---@return number
+  function easingCurve.easeInOutBounce(x)
+    local s = x < 0.5 and -1 or 1
+    x = x < 0.5 and 1 - 2 * x or 2 * x - 1
+    return (1 + s * (
+      x < (1 / 2.75) and 7.5625 * x^2
+      or x < (2 / 2.75) and 7.5625 * (x - 1.5 / 2.75)^2 + 0.75
+      or x < (2.5 / 2.75) and 7.5625 * (x - 2.25 / 2.75)^2 + 0.9375
+      or 7.5625 * (x - 2.625 / 2.75)^2 + 0.984375
+    )) * 0.5
+  end
+
 
   do ---@source https://github.com/gre/bezier-easing/blob/master/src/index.js
 
@@ -652,70 +1067,63 @@ local s, this = pcall(function()
 
     local BezierMT = {
       ---@param self Lib.GS.AnimBlend.Bezier
-      __call = function(self, state, data)
-        if state.done then
-          (state.starting and animPlay or animStop)(state.anim)
-          animBlend(state.anim, data.blend)
-        else
-          local X1, X2 = self[1], self[3]
-          local Y1, Y2 = self[2], self[4]
-          local X = state.progress
-          local T
-          --[[getTForX(state.progress) #start getTForX#]]
-          local intervalStart = 0
-          local curSample = 1
-          local lastSample = self.options.sample_size - 1
-          local samples = self.samples
-          local step_size = samples.step
+      __call = function(self, X)
+        local X1, X2 = self[1], self[3]
+        local Y1, Y2 = self[2], self[4]
+        local T
+        --[[getTForX(state.progress) #start getTForX#]]
+        local intervalStart = 0
+        local curSample = 1
+        local lastSample = self.options.sample_size - 1
+        local samples = self.samples
+        local step_size = samples.step
 
-          while curSample ~= lastSample and samples[curSample] <= X do
-            intervalStart = intervalStart + step_size
-            curSample = curSample + 1
-          end
-          curSample = curSample - 1
-
-          -- Interpolate to provide an initial guess for T
-          local dist = (X - samples[curSample]) / (samples[curSample + 1] - samples[curSample])
-          local Tguess = intervalStart + dist * step_size
-
-          local c1 = (1.0 - 3.0 * X2 + 3.0 * X1)
-          local c2 = (3.0 * X2 - 6.0 * X1)
-          local c3 = (3.0 * X1)
-          --[[getSlope(Tguess, X1, X2)]]
-          local initSlope = 3.0 * c1 * Tguess ^ 2 + 2.0 * c2 * Tguess + c3
-          if (initSlope >= self.options.newton_minslope) then
-            --[[newtonRaphsonIterate(X, Tguess, X1, X2)]]
-            for _ = 1, self.options.newton_iters do
-              --[[getSlope(Tguess, X1, X2)]]
-              local curSlope = 3.0 * c1 * Tguess ^ 2 + 2.0 * c2 * Tguess + c3
-              if (curSlope == 0.0) then break end
-              --[[calcBezier(Tguess, X1, X2) - X]]
-              local curX = (((c1 * Tguess + c2) * Tguess + c3) * Tguess) - X
-              Tguess = Tguess - (curX / curSlope)
-            end
-            T = Tguess
-          elseif (initSlope == 0) then
-            T = Tguess
-          else
-            local A = intervalStart
-            local B = intervalStart + step_size
-            --[[binarySubdivide(X, A, B, X1, X2)]]
-            local curX, curT
-            local iter = 0
-            while (m_abs(curX) > self.options.subdiv_prec and iter < self.options.subdiv_iters) do
-              curT = A + (B - A) * 0.5
-              --[[calcBezier(curT, X1, X2) - X]]
-              curX = ((((1.0 - 3.0 * X2 + 3.0 * X1) * curT + (3.0 * X2 - 6.0 * X1)) * curT + (3.0 * X1)) * curT) - X
-              if curX > 0.0 then B = curT else A = curT end
-              iter = iter + 1
-            end
-            T = curT or (A + (B - A) * 0.5)
-          end
-          --#end getTForX#
-          --[[calcBezier(T, Y1, Y2)]]
-          local prog = (((1.0 - 3.0 * Y2 + 3.0 * Y1) * T + (3.0 * Y2 - 6.0 * Y1)) * T + (3.0 * Y1)) * T
-          animBlend(state.anim, m_lerp(state.from, state.to, prog))
+        while curSample ~= lastSample and samples[curSample] <= X do
+          intervalStart = intervalStart + step_size
+          curSample = curSample + 1
         end
+        curSample = curSample - 1
+
+        -- Interpolate to provide an initial guess for T
+        local dist = (X - samples[curSample]) / (samples[curSample + 1] - samples[curSample])
+        local Tguess = intervalStart + dist * step_size
+
+        local c1 = (1.0 - 3.0 * X2 + 3.0 * X1)
+        local c2 = (3.0 * X2 - 6.0 * X1)
+        local c3 = (3.0 * X1)
+        --[[getSlope(Tguess, X1, X2)]]
+        local initSlope = 3.0 * c1 * Tguess ^ 2 + 2.0 * c2 * Tguess + c3
+        if (initSlope >= self.options.newton_minslope) then
+          --[[newtonRaphsonIterate(X, Tguess, X1, X2)]]
+          for _ = 1, self.options.newton_iters do
+            --[[getSlope(Tguess, X1, X2)]]
+            local curSlope = 3.0 * c1 * Tguess ^ 2 + 2.0 * c2 * Tguess + c3
+            if (curSlope == 0.0) then break end
+            --[[calcBezier(Tguess, X1, X2) - X]]
+            local curX = (((c1 * Tguess + c2) * Tguess + c3) * Tguess) - X
+            Tguess = Tguess - (curX / curSlope)
+          end
+          T = Tguess
+        elseif (initSlope == 0) then
+          T = Tguess
+        else
+          local A = intervalStart
+          local B = intervalStart + step_size
+          --[[binarySubdivide(X, A, B, X1, X2)]]
+          local curX, curT
+          local iter = 0
+          while (m_abs(curX) > self.options.subdiv_prec and iter < self.options.subdiv_iters) do
+            curT = A + (B - A) * 0.5
+            --[[calcBezier(curT, X1, X2) - X]]
+            curX = ((((1.0 - 3.0 * X2 + 3.0 * X1) * curT + (3.0 * X2 - 6.0 * X1)) * curT + (3.0 * X1)) * curT) - X
+            if curX > 0.0 then B = curT else A = curT end
+            iter = iter + 1
+          end
+          T = curT or (A + (B - A) * 0.5)
+        end
+        --#end getTForX#
+        --[[calcBezier(T, Y1, Y2)]]
+        return (((1.0 - 3.0 * Y2 + 3.0 * Y1) * T + (3.0 * Y2 - 6.0 * Y1)) * T + (3.0 * Y1)) * T
       end,
       __index = {
         wrap = function(self) return function(state, data) self(state, data) end end
@@ -724,7 +1132,7 @@ local s, this = pcall(function()
     }
 
 
-    ---Generates a callback that uses a custom bezier curve to blend.
+    ---Generates a custom bezier curve.
     ---
     ---These are expensive to run so use them sparingly or use low settings.
     ---@param x1 number
@@ -732,8 +1140,8 @@ local s, this = pcall(function()
     ---@param x2 number
     ---@param y2 number
     ---@param options? Lib.GS.AnimBlend.BezierOptions
-    ---@return Lib.GS.AnimBlend.blendCallback
-    function callbackGenerators.bezierEasing(x1, y1, x2, y2, options)
+    ---@return Lib.GS.AnimBlend.blendCurve
+    function callbackFunction.genBezier(x1, y1, x2, y2, options)
       -- Because some dumbass won't read the instructions...
       ---@diagnostic disable-next-line: undefined-field
       if type(x1) == "table" and x1.done ~= nil then
@@ -742,7 +1150,7 @@ local s, this = pcall(function()
 
       -- Optimization. This may cause an issue if a Bezier object is expected.
       -- If you actually need a Bezier object then don't make a linear bezier lmao.
-      if x1 == y1 and x2 == y2 then return callbackCurves.linear end
+      if x1 == y1 and x2 == y2 then return easingCurve.linear end
 
       ---===== Verify options =====---
       local to = type(options)
@@ -810,7 +1218,7 @@ local s, this = pcall(function()
 
       local samples = {step = 1 / (options.sample_size - 1)}
 
-      ---@type Lib.GS.AnimBlend.bezierCallback
+      ---@type Lib.GS.AnimBlend.bezierCurve
       local obj = setmetatable({
         x1, y1, x2, y2,
         options = options,
@@ -831,771 +1239,44 @@ local s, this = pcall(function()
     end
   end
 
-  ---Generates a callback that plays other callbacks on a timeline.
-  ---
-  ---An example of a valid timeline:
-  ---```lua
-  ---...timeline({
-  ---  {time = 0, min = 0, max = 1, func = <GSAnimBlend>.callbackCurve.easeInSine},
-  ---  {time = 0.5, min = 1, max = 0.5, func = <GSAnimBlend>.callbackCurve.easeOutCubic},
-  ---  {time = 0.5, min = 0.5, max = 1, func = <GSAnimBlend>.callbackCurve.easeInCubic}
-  ---})
-  ---```
-  ---@param tl Lib.GS.AnimBlend.timeline
-  ---@return Lib.GS.AnimBlend.blendCallback
-  function callbackGenerators.timeline(tl)
-    -- Because some dumbass won't read the instructions...
-    ---@diagnostic disable-next-line: undefined-field
-    if tl.done ~= nil then
-      error("attempt to use generator 'timeline' as a blend callback.", 2)
-    end
-
-    if this.safe then
-      assert(chk.badarg(1, "timeline", tl, "table"))
-      for i, kf in ipairs(tl) do
-        assert(chk.badarg("1[" .. i .. "]", "timeline", kf, "table"))
-      end
-      local time = 0
-      local ftime = tl[1].time
-      if ftime ~= 0 then error("error in keyframe #1: timeline does not start at 0 (got " .. ftime .. ")") end
-      for i, kf in ipairs(tl) do
-        assert(chk.badnum("1[" .. i .. ']["time"]', "timeline", kf.time))
-        if kf.time <= time then
-          error(
-            "error in keyframe #" .. i ..
-            ": timeline did not move forward (from " .. time .. " to " .. kf.time .. ")", 2
-          )
-        end
-
-        if kf.min then assert(chk.badnum("1[" .. i .. ']["min"]', "timeline", kf.min)) end
-        if kf.max then assert(chk.badnum("1[" .. i .. ']["max"]', "timeline", kf.max)) end
-
-        assert(chk.badarg("1[" .. i .. ']["func"]', "timeline", kf.func, "function"), true)
-      end
-    end
-
-    return function(state, data)
-      if state.done then
-        (state.starting and animPlay or animStop)(state.anim)
-        animBlend(state.anim, data.blend)
-      else
-        ---@type Lib.GS.AnimBlend.tlKeyframe, Lib.GS.AnimBlend.tlKeyframe
-        local kf, nextkf
-        for _, _kf in ipairs(tl) do
-          if _kf.time > state.progress then
-            if _kf.time < 1 then nextkf = _kf end
-            break
-          end
-          kf = _kf
-        end
-
-        local adj_prog = m_map(
-          state.progress,
-          kf.time, nextkf and nextkf.time or 1,
-          kf.min or 0, kf.max or 1
-        )
-
-        local newstate = setmetatable(
-          {time = state.max * adj_prog, progress = adj_prog},
-          {__index = state}
-        );
-        (kf.func or this.defaultCallback)(newstate, data)
-      end
-    end
-  end
-
-
-  ---===== CALLBACK CURVES =====---
-
-  ---A callback that uses the `linear` easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.linear(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = state.progress --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * state.progress
-      )
-    end
-  end
-
-  -- I planned to add easeOutIn curves but I'm lazy. I'll do it if people request it.
-
-  ---A callback that uses the [`easeInSine`](https://easings.net/#easeInSine) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInSine(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = (1 - m_cos(state.progress * m_pi * 0.5)) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - m_cos(state.progress * m_1s2pi))
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutSine`](https://easings.net/#easeOutSine) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutSine(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = (m_sin(state.progress * m_pi * 0.5)) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (m_sin(state.progress * m_1s2pi))
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutSine`](https://easings.net/#easeInOutSine) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutSine(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = -(m_cos(state.progress * m_pi) - 1) * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * ((m_cos(state.progress * m_pi) - 1) * -0.5)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInQuad`](https://easings.net/#easeInQuad) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInQuad(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = state.progress ^ 2 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (state.progress ^ 2)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutQuad`](https://easings.net/#easeOutQuad) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutQuad(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = 1 - (1 - state.progress) ^ 2 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - (1 - state.progress) ^ 2)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutQuad`](https://easings.net/#easeInOutQuad) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutQuad(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                    --
-      --   x < 0.5                       --
-      --   and 2 * x ^ 2                 --
-      --   or 1 - (-2 * x + 2) ^ 2 * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and 2 * x ^ 2
-          or 1 - (-2 * x + 2) ^ 2 * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInCubic`](https://easings.net/#easeInCubic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInCubic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = state.progress ^ 3 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (state.progress ^ 3)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutCubic`](https://easings.net/#easeOutCubic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutCubic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = 1 - (1 - state.progress) ^ 3 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - (1 - state.progress) ^ 3)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutCubic`](https://easings.net/#easeInOutCubic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutCubic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                    --
-      --   x < 0.5                       --
-      --   and 4 * x ^ 3                 --
-      --   or 1 - (-2 * x + 2) ^ 3 * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and 4 * x ^ 3
-          or 1 - (-2 * x + 2) ^ 3 * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInQuart`](https://easings.net/#easeInQuart) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInQuart(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = state.progress ^ 4 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (state.progress ^ 4)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutQuart`](https://easings.net/#easeOutQuart) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutQuart(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = 1 - (1 - state.progress) ^ 4 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - (1 - state.progress) ^ 4)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutQuart`](https://easings.net/#easeInOutQuart) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutQuart(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      --local prog =                    --
-      --  x < 0.5                       --
-      --  and 8 * x ^ 4                 --
-      --  or 1 - (-2 * x + 2) ^ 4 * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and 8 * x ^ 4
-          or 1 - (-2 * x + 2) ^ 4 * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInQuint`](https://easings.net/#easeInQuint) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInQuint(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = state.progress ^ 5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (state.progress ^ 5)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutQuint`](https://easings.net/#easeOutQuint) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutQuint(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = 1 - (1 - state.progress) ^ 5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - (1 - state.progress) ^ 5)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutQuint`](https://easings.net/#easeInOutQuint) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutQuint(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                    --
-      --   x < 0.5                       --
-      --   and 16 * x ^ 5                --
-      --   or 1 - (-2 * x + 2) ^ 5 * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and 16 * x ^ 5
-          or 1 - (-2 * x + 2) ^ 5 * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInExpo`](https://easings.net/#easeInExpo) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInExpo(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =           --
-      --   x == 0               --
-      --   and 0                --
-      --   or 2 ^ (10 * x - 10) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x == 0
-          and 0
-          or 2 ^ (10 * x - 10)
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutExpo`](https://easings.net/#easeOutExpo) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutExpo(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =           --
-      --   x == 1               --
-      --   and 1                --
-      --   or 1 - 2 ^ (-10 * x) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x == 1
-          and 1
-          or 1 - 2 ^ (-10 * x)
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutExpo`](https://easings.net/#easeInOutExpo) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutExpo(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                             --
-      --   (x == 0 or x == 1) and x               --
-      --   or x < 0.5 and 2 ^ (20 * x - 10) * 0.5 --
-      --   or (2 - 2 ^ (-20 * x + 10)) * 0.5      --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          (x == 0 or x == 1) and x
-          or x < 0.5 and 2 ^ (20 * x - 10) * 0.5
-          or (2 - 2 ^ (-20 * x + 10)) * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInCirc`](https://easings.net/#easeInCirc) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInCirc(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = 1 - m_sqrt(1 - state.progress ^ 2) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 - m_sqrt(1 - state.progress ^ 2))
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutCirc`](https://easings.net/#easeOutCirc) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutCirc(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      -- local prog = m_sqrt(1 - (state.progress - 1) ^ 2) --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * m_sqrt(1 - (state.progress - 1) ^ 2)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutCirc`](https://easings.net/#easeInOutCirc) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutCirc(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                                  --
-      --   x < 0.5                                     --
-      --   and (1 - m_sqrt(1 - (2 * x) ^ 2)) * 0.5     --
-      --   or (m_sqrt(1 - (-2 * x + 2) ^ 2) + 1) * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and (1 - m_sqrt(1 - (2 * x) ^ 2)) * 0.5
-          or (m_sqrt(1 - (-2 * x + 2) ^ 2) + 1) * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInBack`](https://easings.net/#easeInBack) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInBack(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- magic c1 <1.70158> = 1.70158                   --
-      -- magic c2 <2.70158> = c1 + 1                    --
-      -- local prog = 2.70158 * x ^ 3 - 1.70158 * x ^ 2 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (2.70158 * x ^ 3 - 1.70158 * x ^ 2)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutBack`](https://easings.net/#easeOutBack) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutBack(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local xm1 = state.progress - 1
-      -- magic c1 <1.70158> = 1.70158                       --
-      -- magic c2 <2.70158> = c1 + 1                        --
-      -- local prog = 1 + 2.70158 * x ^ 3 + 1.70158 * x ^ 2 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (1 + 2.70158 * xm1 ^ 3 + 1.70158 * xm1 ^ 2)
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutBack`](https://easings.net/#easeInOutBack) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutBack(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      local x2 = x * 2
-      -- magic c1 <1.70158>   = 1.70158                                     --
-      -- magic c2 <2.5949095> = c1 * 1.525                                  --
-      -- magic c3 <3.5949095> = c2 + 1                                      --
-      -- local prog =                                                       --
-      --   x < 0.5                                                          --
-      --   and (x2 ^ 2 * (3.5949095 * x2 - 2.5949095)) * 0.5                --
-      --   or ((x2 - 2) ^ 2 * (3.5949095 * (x2 - 2) + 2.5949095) + 2) * 0.5 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 0.5
-          and (x2 ^ 2 * (3.5949095 * x2 - 2.5949095)) * 0.5
-          or ((x2 - 2) ^ 2 * (3.5949095 * (x2 - 2) + 2.5949095) + 2) * 0.5
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInElastic`](https://easings.net/#easeInElastic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInElastic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                                                     --
-      --   (x == 0 or x == 1) and x                                       --
-      --   or -(2 ^ (10 * x - 10)) * m_sin((x * 10 - 10.75) * m_pi / 1.5) --
-      animBlend(
-        state.anim, 
-        from + (state.to - from) * (
-          (x == 0 or x == 1) and x
-          or -(2 ^ (10 * x - 10)) * m_sin((x * 10 - 10.75) * m_2s3pi)
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutElastic`](https://easings.net/#easeOutElastic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutElastic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                                                 --
-      --   (x == 0 or x == 1) and x                                   --
-      --   or 2 ^ (-10 * x) * m_sin((x * 10 - 0.75) * m_pi / 1.5) + 1 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          (x == 0 or x == 1) and x
-          or 2 ^ (-10 * x) * m_sin((x * 10 - 0.75) * m_2s3pi) + 1
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutElastic`](https://easings.net/#easeInOutElastic) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutElastic(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- local prog =                                                                   --
-      --   (x == 0 or x == 1) and x                                                     --
-      --   or x < 0.5 and -(2 ^ (x * 20 - 10) * m_sin((x * 20 - 11.125) * m_pi / 2.25)) * 0.5 --
-      --   or (2 ^ (-x * 20 + 10) * m_sin((x * 20 - 11.125) * m_pi / 2.25)) * 0.5 + 1         --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          (x == 0 or x == 1) and x
-          or x < 0.5 and -(2 ^ (x * 20 - 10) * m_sin((x * 20 - 11.125) * m_4s9pi)) * 0.5
-          or (2 ^ (x * -20 + 10) * m_sin((x * 20 - 11.125) * m_4s9pi)) * 0.5 + 1
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInBounce`](https://easings.net/#easeInBounce) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInBounce(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = 1 - state.progress
-      -- magic c1 <7.5625> = 7.5625                                        --
-      -- magic c2 <2.75>   = 2.75                                          --
-      -- local prog =                                                      --
-      --   1 - (                                                           --
-      --     x < 1 / 2.75 and 7.5625 * x ^ 2                               --
-      --     or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75      --
-      --     or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375 --
-      --     or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375                 --
-      --   )                                                               --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          1 - (
-            x < 1 / 2.75 and 7.5625 * x ^ 2
-            or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75
-            or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375
-            or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375
-          )
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeOutBounce`](https://easings.net/#easeOutBounce) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeOutBounce(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      -- magic c1 <7.5625> = 7.5625                                      --
-      -- magic c2 <2.75>   = 2.75                                        --
-      -- local prog =                                                    --
-      --   x < 1 / 2.75 and 7.5625 * x ^ 2                               --
-      --   or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75      --
-      --   or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375 --
-      --   or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375                 --
-      animBlend(
-        state.anim,
-        from + (state.to - from) * (
-          x < 1 / 2.75 and 7.5625 * x ^ 2
-          or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75
-          or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375
-          or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375
-        )
-      )
-    end
-  end
-
-  ---A callback that uses the [`easeInOutBounce`](https://easings.net/#easeInOutBounce) easing method to blend.
-  ---@param state Lib.GS.AnimBlend.CallbackState
-  ---@param data Lib.GS.AnimBlend.AnimData
-  function callbackCurves.easeInOutBounce(state, data)
-    if state.done then
-      (state.starting and animPlay or animStop)(state.anim)
-      animBlend(state.anim, data.blend)
-    else
-      local from = state.from
-      local x = state.progress
-      local s = x < 0.5 and -1 or 1
-      x = x < 0.5 and 1 - 2 * x or 2 * x - 1
-      -- magic c1 <7.5625> = 7.5625
-      -- magic c2 <2.75>   = 2.75
-      -- local prog =
-      --   (1 + s * (
-      --     x < 1 / 2.75 and 7.5625 * x ^ 2
-      --     or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75
-      --     or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375
-      --     or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375
-      --   )) * 0.5
-      animBlend(
-        state.anim,
-        -- What the fuck.
-        from + (state.to - from) * (
-          (1 + s * (
-            x < 1 / 2.75 and 7.5625 * x ^ 2
-            or x < 2 / 2.75 and 7.5625 * (x - 1.5 / 2.75) ^ 2 + 0.75
-            or x < 2.5 / 2.75 and 7.5625 * (x - 2.25 / 2.75) ^ 2 + 0.9375
-            or 7.5625 * (x - 2.625 / 2.75) ^ 2 + 0.984375
-          )) * 0.5
-        )
-      )
-    end
-  end
-
 
   ---The default callback used by this library. This is used when no other callback is being used.
-  this.defaultCallback = callbackCurves["lin" .. "ear"]
-  this.callbackGen = callbackGenerators
-  this.callbackCurve = callbackCurves
+  ---@type Lib.GS.AnimBlend.blendCallback
+  this.defaultCallback = callbackFunction[("base")]
+  ---The default curve used by this library. This is used when no other curve is being used.
+  ---@type Lib.GS.AnimBlend.blendCurve
+  this.defaultCurve = easingCurve[("linear")]
+  this.callback = callbackFunction
+  this.curve = easingCurve
 
 
   -----===================================== BLENDING LOGIC =====================================-----
 
   events.TICK:register(function()
     ticker = ticker + 1
+
+    -- Blends stop updating when the player is unloaded. Force blends to end early if this happens.
+    if not player:isLoaded() then
+      for anim in pairs(blending) do
+        local data = animData[anim]
+        local state = data.state
+
+        -- Paused blends don't do anything anyways so this isn't an issue.
+        if not state.paused then
+          local cbs = state.callbackState
+          cbs.time = cbs.max
+          cbs.rawProgress = 1
+          cbs.progress = state.curve(1)
+          cbs.done = true
+
+          -- Do final callback.
+          for _, cb in ipairs(state.callbacks) do cb(cbs, data) end
+          blending[anim] = nil
+          animPlaying(cbs.anim, state.starting)
+          animBlend(cbs.anim, data.blend)
+        end
+      end
+    end
   end, "GSAnimBlend:Tick_TimeTicker")
 
   events.RENDER:register(function(delta, ctx)
@@ -1607,28 +1288,40 @@ local s, this = pcall(function()
       local data = animData[anim]
       local state = data.state
       if not state.paused then
-        local cbs = state.callbackState
-        state.time = state.time + elapsed_time
-        if not state.max then cbs.max = state.starting and data.blendTimeIn or data.blendTimeOut end
-        if not state.from then
-          cbs.from = data.blendSane
-        elseif not state.to then
-          cbs.to = data.blendSane
-        end
+        if state.delay > 0 then state.delay = state.delay - elapsed_time end
+        if state.delay <= 0 then
+          local cbs = state.callbackState
+          state.time = state.time + elapsed_time
+          cbs.max = state.max or (state.starting and data.blendTimeIn or data.blendTimeOut)
+          if not state.from then
+            cbs.from = data.blendSane
+            cbs.to = state.to
+          elseif not state.to then
+            cbs.from = state.from
+            cbs.to = data.blendSane
+          else
+            cbs.from = state.from
+            cbs.to = state.to
+          end
 
-        -- When a blend stops, update all info to signal it has stopped.
-        if (state.time >= cbs.max) or (animGetPlayState(anim) == "STOPPED") then
-          cbs.time = cbs.max
-          cbs.progress = 1
-          cbs.done = true
+          -- When a blend stops, update all info to signal it has stopped.
+          if (state.time >= cbs.max) or (animGetPlayState(anim) == "STOPPED") then
+            cbs.time = cbs.max
+            cbs.rawProgress = 1
+            cbs.progress = state.curve(1)
+            cbs.done = true
 
-          -- Do final callback.
-          state.callback(cbs, animData[anim])
-          blending[anim] = nil
-        else
-          cbs.time = state.time
-          cbs.progress = cbs.time / cbs.max
-          state.callback(cbs, animData[anim])
+            -- Do final callback.
+            for _, cb in ipairs(state.callbacks) do cb(cbs, data) end
+            blending[anim] = nil
+            animPlaying(cbs.anim, state.starting)
+            animBlend(cbs.anim, data.blend)
+          else
+            cbs.time = state.time
+            cbs.rawProgress = cbs.time / cbs.max
+            cbs.progress = state.curve(cbs.rawProgress)
+            for _, cb in ipairs(state.callbacks) do cb(cbs, data) end
+          end
         end
       end
     end
@@ -1645,21 +1338,23 @@ local s, this = pcall(function()
 
   function animationGetters:blendCallback()
     if this.safe then assert(chk.badarg(1, "__index", self, "Animation")) end
-    return animData[self].callback
+    return animData[self].callbacks[0]
   end
   function animationSetters:blendCallback(value)
     if this.safe then
       assert(chk.badarg(1, "__newindex", self, "Animation"))
-      if type(value) ~= "string" then
-        assert(chk.badarg(3, "__newindex", value, "function", true))
-      end
+      assert(chk.badarg(3, "__newindex", value, "function", true))
     end
 
-    if type(func) == "string" then
-      value = callbackCurves[value]
-      if not value then error("bad argument #3 of '__newindex' ('" .. func .. "' is not a valid curve)") end
-    end
-    animData[self].callback = value
+    local data = animData[self]
+    data.callbacks[0] = value
+
+    local callbacks_cache = {}
+    for k, v in pairs(data.callbacksCache) do callbacks_cache[k] = v end
+    callbacks_cache[callbacks_cache.priority_0] = value
+    callbacks_cache.use_default = value == nil
+    data.callbacksCache = callbacks_cache
+    return self
   end
 
 
@@ -1667,11 +1362,34 @@ local s, this = pcall(function()
 
   local animationMethods = {}
 
-  function animationMethods:play()
+  function animationMethods:newCode(time, code)
+    local data = animData[self]
+    if time == 0 then
+      ---@diagnostic disable-next-line: redundant-parameter
+      data.startFunc = load(code, ("animations.%s.%s"):format(data.model, self.name))
+      data.startSource = code
+    elseif time == data.length then
+      ---@diagnostic disable-next-line: redundant-parameter
+      data.endFunc = load(code, ("animations.%s.%s"):format(data.model, self.name))
+      data.endSource = code
+    else
+      return animNewCode(self, time, code)
+    end
+
+    return self
+  end
+
+  function animationMethods:play(instant)
     if this.safe then assert(chk.badarg(1, "play", self, "Animation")) end
 
     if blending[self] then
-      local state = animData[self].state
+      if instant then
+        this.stopBlend(self, true)
+        return self
+      end
+
+      local data = animData[self]
+      local state = data.state
       if state.paused then
         state.paused = false
         return self
@@ -1680,11 +1398,10 @@ local s, this = pcall(function()
       end
 
       animStop(self)
-      local cbs = state.callbackState
-      local time = cbs.max * cbs.progress
+      local time = data.blendTimeIn * state.callbackState.progress
       this.blend(self, time, animGetBlend(self), nil, true)
       return self
-    elseif animData[self].blendTimeIn == 0 or animGetPlayState(self) ~= "STOPPED" then
+    elseif instant or animData[self].blendTimeIn == 0 or animGetPlayState(self) ~= "STOPPED" then
       return animPlay(self)
     end
 
@@ -1692,18 +1409,25 @@ local s, this = pcall(function()
     return self
   end
 
-  function animationMethods:stop()
+  function animationMethods:stop(instant)
     if this.safe then assert(chk.badarg(1, "stop", self, "Animation")) end
 
     if blending[self] then
-      local state = animData[self].state
-      if not state.starting then return self end
+      if instant then
+        this.stopBlend(self, false)
+        return self
+      end
 
-      local cbs = state.callbackState
-      local time = cbs.max * cbs.progress
+      local data = animData[self]
+      local state = data.state
+      if not state.starting then
+        return self
+      end
+
+      local time = data.blendTimeOut * state.callbackState.progress
       this.blend(self, time, animGetBlend(self), 0, false)
       return self
-    elseif animData[self].blendTimeOut == 0 or animGetPlayState(self) == "STOPPED" then
+    elseif instant or animData[self].blendTimeOut == 0 or animGetPlayState(self) == "STOPPED" then
       return animStop(self)
     end
 
@@ -1725,17 +1449,18 @@ local s, this = pcall(function()
   function animationMethods:restart(blend)
     if this.safe then assert(chk.badarg(1, "restart", self, "Animation")) end
 
-    if blend then
+    if blend and blending[self] then
+      local data = animData[self]
+      local state = data.state
+
       animStop(self)
-      this.blend(self, nil, 0, nil, true)
-    elseif blending[self] then
-      animBlend(self, animData[self].blend)
-      blending[self] = nil
-    else
-      animRestart(self)
+      local time = data.blendTimeIn * state.callbackState.progress
+      this.blend(self, time, animGetBlend(self), nil, true)
+      return self
     end
 
-    return self
+    this.stopBlend(self, false)
+    return animRestart(self)
   end
 
 
@@ -1745,6 +1470,14 @@ local s, this = pcall(function()
     if this.safe then assert(chk.badarg(1, "getBlendTime", self, "Animation")) end
     local data = animData[self]
     return data.blendTimeIn, data.blendTimeOut
+  end
+
+  function animationMethods:getBlendCallback(priority)
+    if this.safe then
+      assert(chk.badarg(1, "getBlendCallback", self, "Animation"))
+      assert(chk.badnum(2, "getBlendCallback", priority, true))
+    end
+    return animData[self].callbacks[priority or 0]
   end
 
   function animationMethods:isBlending()
@@ -1759,11 +1492,13 @@ local s, this = pcall(function()
 
   function animationMethods:getPlayState()
     if this.safe then assert(chk.badarg(1, "getPlayState", self, "Animation")) end
-    return blending[self]
-      and (animData[self].state.paused
-        and "PAUSED"
-        or "PLAYING")
-      or animGetPlayState(self)
+    return blending[self] and (animData[self].state.paused and "PAUSED" or "PLAYING") or animGetPlayState(self)
+  end
+
+  function animationMethods:getTime()
+    if this.safe then assert(chk.badarg(1, "getPlayState", self, "Animation")) end
+    local state = animData[self].state
+    return blending[self] and state.delay > 0 and (state.delay / -20) or animGetTime(self)
   end
 
   function animationMethods:isPlaying()
@@ -1792,19 +1527,69 @@ local s, this = pcall(function()
     return self
   end
 
-  function animationMethods:setOnBlend(func)
+  function animationMethods:setOnBlend(func, priority)
     if this.safe then
       assert(chk.badarg(1, "setOnBlend", self, "Animation"))
-      if type(func) ~= "string" then
-        assert(chk.badarg(2, "setOnBlend", func, "function", true))
+      assert(chk.badarg(2, "setOnBlend", func, "function", true))
+      assert(chk.badarg(3, "setOnBlend", priority, "number", true))
+    end
+
+    local data = animData[self]
+    priority = priority or 0
+
+    local old = data.callbacks[priority or 0]
+    if func == old then return self end
+
+    if priority == 0 then
+      data.callbacks[0] = func
+
+      local callbacks_cache = {}
+      for k, v in pairs(data.callbacksCache) do callbacks_cache[k] = v end
+      callbacks_cache[callbacks_cache.priority_0] = func
+      callbacks_cache.use_default = func == nil
+      data.callbacksCache = callbacks_cache
+      return self
+    end
+
+    local callbacks = data.callbacks
+    callbacks[priority] = func
+
+    local callbacks_cache = {}
+    local use_default = true
+    for i in pairs(callbacks) do
+      if i == 0 then use_default = false end
+      callbacks_cache[#callbacks_cache+1] = i
+    end
+
+    if use_default then callbacks_cache[#callbacks_cache+1] = 0 end
+    table.sort(callbacks_cache)
+
+    for i, v in ipairs(callbacks_cache) do
+      if v == 0 then callbacks_cache.priority_0 = i end
+      callbacks_cache[i] = callbacks[v]
+    end
+
+    callbacks_cache.use_default = use_default
+    data.callbacksCache = callbacks_cache
+
+    return self
+  end
+
+  function animationMethods:setBlendCurve(curve)
+    local curve_isstr = type(curve) == "string"
+
+    if this.safe then
+      assert(chk.badarg(1, "setBlendCurve", self, "Animation"))
+      if not curve_isstr then
+        assert(chk.badarg(2, "setBlendCurve", curve, "function", true))
       end
     end
 
-    if type(func) == "string" then
-      func = callbackCurves[func]
-      if not func then error("bad argument #2 of 'setOnBlend' ('" .. func .. "' is not a valid curve)") end
+    if curve_isstr then
+      curve = easingCurve[curve]
+        or error("bad argument #2 of 'setBlendCurve' ('" .. curve .. "' is not a valid curve)", 2)
     end
-    animData[self].callback = func
+    animData[self].curve = curve
     return self
   end
 
@@ -1823,26 +1608,40 @@ local s, this = pcall(function()
 
   function animationMethods:setLength(len)
     if len == nil then len = 0 end
+    if len == self:getLength() then return animLength(self, len) end
     if this.safe then
       assert(chk.badarg(1, "setLength", self, "Animation"))
       assert(chk.badarg(2, "setLength", len, "number"))
     end
 
     local data = animData[self]
-    if data.length then animNewCode(self, data.length - tPass, "") end
-
-    local lenSane = makeSane(len, -1)
-    data.length = lenSane > tPass and lenSane or false
-
-    if data.length then
-      animNewCode(self, m_max(data.length - tPass, 0), blendCommand:format(data.triggerId))
+    if data.endSource or (data.length and data.length ~= 0) then
+      animNewCode(self, data.length, data.endSource or "")
+      data.endFunc = nil
+      data.endSource = nil
     end
+
+    local lenSane = makeSane(len, false)
+
+    if data.length == 0 then
+      animNewCode(self, 0, blendCommand:format(data.triggerId, "true"))
+    end
+
+    if lenSane then
+      if lenSane == 0 then
+        animNewCode(self, 0, blendCommand:format(data.triggerId, "nil"))
+      else
+        animNewCode(self, lenSane, blendCommand:format(data.triggerId, "false"))
+      end
+    end
+    data.length = lenSane
+
     return animLength(self, len)
   end
 
-  function animationMethods:setPlaying(state)
+  function animationMethods:setPlaying(state, instant)
     if this.safe then assert(chk.badarg(1, "setPlaying", self, "Animation")) end
-    return state and self:play() or self:stop()
+    return state and self:play(instant) or self:stop(instant)
   end
 
 
@@ -1850,6 +1649,7 @@ local s, this = pcall(function()
 
   animationMethods.blendTime = animationMethods.setBlendTime
   animationMethods.onBlend = animationMethods.setOnBlend
+  animationMethods.blendCurve = animationMethods.setBlendCurve
   animationMethods.blend = animationMethods.setBlend
   animationMethods.length = animationMethods.setLength
   animationMethods.playing = animationMethods.setPlaying
@@ -1880,13 +1680,16 @@ local s, this = pcall(function()
 
   if animationapi_mt then
     local apiMethods = {}
+    local PAST = cmp("0.1.4") ~= 1
 
-    function apiMethods:getPlaying(ignore_blending)
+    function apiMethods:getPlaying(hold, ignore_blending)
       if this.safe then assert(chk.badarg(1, "getPlaying", self, "AnimationAPI")) end
-      if ignore_blending then return animapiGetPlaying(animations) end
+      if ignore_blending then return animapiGetPlaying(self, hold) end
+      if PAST then hold = false end
+
       local anims = {}
-      for _, anim in ipairs(animations:getAnimations()) do
-        if anim:isPlaying() then anims[#anims+1] = anim end
+      for _, anim in ipairs(self:getAnimations()) do
+        if anim:isPlaying() or (hold and anim:isHolding()) then anims[#anims+1] = anim end
       end
 
       return anims
@@ -1896,7 +1699,6 @@ local s, this = pcall(function()
       return apiMethods[key] or _animationapiIndex(self, key)
     end
   end
-
 
   return setmetatable(this, thismt)
 end)
@@ -1920,35 +1722,48 @@ else -- This is *all* error handling.
       end
     elseif line:match("in function 'pcall'") then
       -- If the level *is* a Java level and it contains the pcall, remove both it and the level above.
-      stack_lines[#stack_lines] = stack_lines[#stack_lines]:gsub("in function %b<>", "in protected chunk")
+      if #stack_lines > 0 then
+        stack_lines[#stack_lines] = stack_lines[#stack_lines]:gsub("in function %b<>", "in protected chunk")
+      end
       skip_next = true
     end
   end
 
-  e_stack = table.concat(stack_lines, "\n")
-
-  local cmp = client.compareVersions
-  local ver = client.getFiguraVersion():match("^([^%+]*)"):gsub("^([pr])", "0.1.3-%1")
   local extra_reason = ""
 
-  if FIG[1] and cmp(ver, FIG[1]) == -1 then
-    extra_reason = ("\n§oYour Figura version (%s) is below the recommended minimum of %s§r"):format(ver, FIG[1])
-  elseif FIG[2] and cmp(ver, FIG[2]) == 1 then
-    extra_reason = ("\n§oYour Figura version (%s) is above the recommended maximum of %s§r"):format(ver, FIG[2])
+  local check = 0
+  if FIG[1] then
+    check = cmp(FIG[1])
+    if check == -1 then
+      extra_reason = ("\n§7§oYour Figura version (%s) is below the recommended minimum of %s§r"):format(CLIENT_VERSION, FIG[1])
+    elseif not check then
+      check = nil
+    end
   end
+  if check and FIG[2] then
+    check = cmp(FIG[2])
+    if check == 1 then
+      extra_reason = ("\n§7§oYour Figura version (%s) is above the recommended maximum of %s§r"):format(CLIENT_VERSION, FIG[2])
+    elseif not check then
+      check = nil
+    end
+  end
+
+  if not check then extra_reason = ("\n§7§oYour Figura version (%s) is not valid!§r"):format(CLIENT_VERSION) end
 
   error(
     (
       "'%s' failed to load\z
-       \n§7INFO: %s v%s | %s§r%s\z
+       \n§7INFO: %s v%s | %s§c%s\z
        \ncaused by:\z
        \n  §4%s\z
-       \n  §4stack traceback:\z
-       \n%s§r"
+       \n  stack traceback:\z
+       \n%s§c"
     ):format(
       ID,
-      ID, VER, ver, extra_reason,
-      e_msg, e_stack
+      ID, VER, CLIENT_VERSION, extra_reason,
+      e_msg:gsub("\n", "\n  §4"),
+      table.concat(stack_lines, "\n")
     ),
     2
   )
@@ -1974,10 +1789,24 @@ end
 ---If this is `false`, there is no stop instruction due to length limits.
 ---@field length number|false
 ---The id for this animation's blend trigger
----@field triggerId string
----The callback function this animation will call every frame while it is blending and one final
+---@field triggerId integer
+---The name of the model this animation belongs to.
+---@field model string
+---The original instruction keyframe at the start of the animation.
+---@field startFunc? function
+---The original instruction keyframe at the end of the animation.
+---@field endFunc? function
+---The original string source of the instruction keyframe at the start of the animation.
+---@field startSource? string
+---The original string source of the instruction keyframe at the end of the animation.
+---@field endSource? string
+---The callback functions this animation will call every frame while it is blending and one final
 ---time when blending finishes.
----@field callback? Lib.GS.AnimBlend.blendCallback
+---@field callbacks {[integer]: Lib.GS.AnimBlend.blendCallback}
+---The cached order of this animation's callbacks. Don't touch this.
+---@field callbacksCache {[integer]: Lib.GS.AnimBlend.blendCallback, priority_0: integer, use_default: boolean}
+---The curve that the blending progress is modified with.
+---@field curve? Lib.GS.AnimBlend.blendCurve
 ---The active blend state.
 ---@field state? Lib.GS.AnimBlend.BlendState
 
@@ -1990,14 +1819,18 @@ end
 ---@field from number|false
 ---The ending blend weight.
 ---@field to number|false
----The callback to call each blending frame.
----@field callback Lib.GS.AnimBlend.blendCallback
+---The callbacks to call each blending frame.
+---@field callbacks {[integer]: Lib.GS.AnimBlend.blendCallback, priority_0: integer}
+---The curve that the blending progress is modified with.
+---@field curve? Lib.GS.AnimBlend.blendCurve
 ---The state proxy used in the blend callback function.
 ---@field callbackState Lib.GS.AnimBlend.CallbackState
 ---Determines if this blend is paused.
 ---@field paused boolean
 ---Determines if this blend is starting or ending an animation.
 ---@field starting boolean
+---Determines how long a delay waits before playing.
+---@field delay number
 
 ---@class Lib.GS.AnimBlend.CallbackState
 ---The animation this callback is acting on.
@@ -2006,8 +1839,11 @@ end
 ---@field time number
 ---The maximum time this blend will run in ticks.
 ---@field max number
----The progress as a percentage.
+---The progress as a percentage modified by the current curve.  
+---This can be above 1 or below 0 if the curve results in it.
 ---@field progress number
+---The progress as a percentage without any curve modifications.
+---@field rawProgress number
 ---The starting blend weight.
 ---@field from number
 ---The ending blend weight.
@@ -2046,7 +1882,7 @@ end
 ---@field sample_size? integer
 
 ---@class Lib.GS.AnimBlend.Bezier: function
----@overload fun(state: Lib.GS.AnimBlend.CallbackState, data: Lib.GS.AnimBlend.AnimData)
+---@overload fun(progress: number): number
 ---The X1 value.
 ---@field [1] number
 ---The Y1 value.
@@ -2082,28 +1918,34 @@ end
 ---
 ---The default value is `1`.
 ---@field max? number
----The blending callback to use for this entire frame.  
+---The blending callback to use for this entire keyframe.  
 ---The adjusted-progress is given to this callback as it runs.
 ---
----If a string is given instead of a callback, it is treated as the name of a curve found in
----`<GSAnimBlend>.callbackCurves`.  
 ---If `nil` is given, the default callback is used.
 ---
 ---Note: Blending callbacks called by this function will **never** call cleanup code. Care should be taken to make sure
 ---this does not break anything.
----@field func? Lib.GS.AnimBlend.blendCallback | Lib.GS.AnimBlend.curve
+---@field callback? Lib.GS.AnimBlend.blendCallback
+---The easing curve to use for this entire keyframe.  
+---The adjusted-progress is given to this callback as it runs.
+---
+---If a string is given instead of a callback, it is treated as the name of a curve found in
+---`<GSAnimBlend>.callbackCurve`.  
+---If `nil` is given, the default curve is used.
+---@field curve? Lib.GS.AnimBlend.blendCurve | Lib.GS.AnimBlend.curve
 
 ---@alias Lib.GS.AnimBlend.blendCallback
 ---| fun(state: Lib.GS.AnimBlend.CallbackState, data: Lib.GS.AnimBlend.AnimData)
 
----@alias Lib.GS.AnimBlend.bezierCallback
----| Lib.GS.AnimBlend.Bezier
----| Lib.GS.AnimBlend.blendCallback
+---@alias Lib.GS.AnimBlend.blendCurve fun(progress: number): number
+
+---@alias Lib.GS.AnimBlend.bezierCurve Lib.GS.AnimBlend.Bezier | Lib.GS.AnimBlend.blendCurve
 
 ---@alias Lib.GS.AnimBlend.timeline Lib.GS.AnimBlend.tlKeyframe[]
 
----@alias Lib.GS.AnimBlend.curve string
+---@alias Lib.GS.AnimBlend.curve
 ---| "linear"           # The default blending curve. Goes from 0 to 1 without any fancy stuff.
+---| "smoothStep"       # A more performant but less accurate version of easeInOutSine.
 ---| "easeInSine"       # [Learn More...](https://easings.net/#easeInSine)
 ---| "easeOutSine"      # [Learn More...](https://easings.net/#easeOutSine)
 ---| "easeInOutSine"    # [Learn More...](https://easings.net/#easeInOutSine)
@@ -2138,11 +1980,11 @@ end
 
 ---@class Animation
 ---#### [GS AnimBlend Library]
----The callback that should be called every frame while the animation is blending.
+---The callback with priority 0 that should be called every frame while the animation is blending.
 ---
 ---This allows adding custom behavior to the blending feature.
 ---
----If this is `nil`, it will default to the library's basic callback.
+---If this is `nil`, it will default to the library's base callback.
 ---@field blendCallback? Lib.GS.AnimBlend.blendCallback
 local Animation
 
@@ -2150,10 +1992,36 @@ local Animation
 ---===== METHODS =====---
 
 ---#### [GS AnimBlend Library]
+---Starts or resumes this animation. Does nothing if the animation is already playing.  
+---If `instant` is set, no blending will occur.
+---
+---If `instant` is `nil`, it will default to `false`.
+---@generic self
+---@param self self
+---@param instant? boolean
+---@return self
+function Animation:play(instant) end
+
+---#### [GS AnimBlend Library]
 ---Starts this animation from the beginning, even if it is currently paused or playing.
 ---
 ---If `blend` is set, it will also restart with a blend.
+---@generic self
+---@param self self
+---@param blend? boolean
+---@return self
 function Animation:restart(blend) end
+
+---#### [GS AnimBlend Library]
+---Stops this animation.  
+---If `instant` is set, no blending will occur.
+---
+---If `instant` is `nil`, it will default to `false`.
+---@generic self
+---@param self self
+---@param instant? boolean
+---@return self
+function Animation:stop(instant) end
 
 
 ---===== GETTERS =====---
@@ -2162,6 +2030,14 @@ function Animation:restart(blend) end
 ---Gets the blending times of this animation in ticks.
 ---@return number, number
 function Animation:getBlendTime() end
+
+---#### [GS AnimBlend Library]
+---Gets the blending callback at the given priority in this animation.
+---
+---If `priority` is `nil`, it will default to `0`.
+---@param priority? integer
+---@return Lib.GS.AnimBlend.blendCallback?
+function Animation:getBlendCallback(priority) end
 
 ---#### [GS AnimBlend Library]
 ---Gets if this animation is currently blending.
@@ -2173,8 +2049,14 @@ function Animation:isBlending() end
 
 ---#### [GS AnimBlend Library]
 ---Sets the blending time of this animation in ticks.
----
----If two values are given, the blending in and out times are set respectively.
+---@generic self
+---@param self self
+---@param time? number
+---@return self
+function Animation:setBlendTime(time) end
+
+---#### [GS AnimBlend Library]
+---Sets the blending-in and blending-out times of this animation in ticks.
 ---@generic self
 ---@param self self
 ---@param time_in? number
@@ -2183,20 +2065,50 @@ function Animation:isBlending() end
 function Animation:setBlendTime(time_in, time_out) end
 
 ---#### [GS AnimBlend Library]
----Sets the blending callback of this animation.
+---Sets a blending callback at the given priority in this animation.  
+---Higher priorities run later. Only one callback may have a given priority in an animation.
+---
+---If `priority` is `nil`, it will default to `0`.
 ---@generic self
 ---@param self self
 ---@param func? Lib.GS.AnimBlend.blendCallback
+---@param priority? integer
 ---@return self
-function Animation:setOnBlend(func) end
+function Animation:setOnBlend(func, priority) end
+
+---#### [GS AnimBlend Library]
+---Sets the easing curve of this animation.
+---@generic self
+---@param self self
+---@param curve? Lib.GS.AnimBlend.blendCurve | Lib.GS.AnimBlend.curve
+---@return self
+function Animation:setBlendCurve(curve) end
+
+---#### [GS AnimBlend Library]
+---Sets if this animation is currently playing.  
+---If `instant` is set, no blending will occur.
+---
+---If `state` or `instant` are `nil`, they will default to `false`.
+---@generic self
+---@param self self
+---@param state? boolean
+---@param instant? boolean
+---@return self
+function Animation:setPlaying(state, instant) end
 
 
 ---===== CHAINED =====---
 
 ---#### [GS AnimBlend Library]
 ---Sets the blending time of this animation in ticks.
----
----If two values are given, the blending in and out times are set respectively.
+---@generic self
+---@param self self
+---@param time? number
+---@return self
+function Animation:blendTime(time) end
+
+---#### [GS AnimBlend Library]
+---Sets the blending-in and blending-out times of this animation in ticks.
 ---@generic self
 ---@param self self
 ---@param time_in? number
@@ -2205,12 +2117,37 @@ function Animation:setOnBlend(func) end
 function Animation:blendTime(time_in, time_out) end
 
 ---#### [GS AnimBlend Library]
----Sets the blending callback of this animation.
+---Sets a blending callback at the given priority in this animation.  
+---Higher priorities run later. Only one callback may have a given priority in an animation.
+---
+---If `priority` is `nil`, it will default to `0`.
 ---@generic self
 ---@param self self
 ---@param func? Lib.GS.AnimBlend.blendCallback
+---@param priority? integer
 ---@return self
-function Animation:onBlend(func) end
+function Animation:onBlend(func, priority) end
+
+---#### [GS AnimBlend Library]
+---Sets the easing curve of this animation.
+---@generic self
+---@param self self
+---@param curve? Lib.GS.AnimBlend.blendCurve | Lib.GS.AnimBlend.curve
+---@return self
+---@diagnostic disable-next-line: assign-type-mismatch
+function Animation:blendCurve(curve) end
+
+---#### [GS AnimBlend Library]
+---Sets if this animation is currently playing.  
+---If `instant` is set, no blending will occur.
+---
+---If `state` or `instant` are `nil`, they will default to `false`.
+---@generic self
+---@param self self
+---@param state? boolean
+---@param instant? boolean
+---@return self
+function Animation:playing(state, instant) end
 
 
 ---@class AnimationAPI
@@ -2219,10 +2156,12 @@ local AnimationAPI
 
 ---===== GETTERS =====---
 
----#### [GS AnimBlend Library]
----Gets an array of every playing animation.
+---#### [GS AnimBlend Library] (0.1.5+)
+---Gets an array of every playing animation.  
+---**`(0.1.5+ only)`** If `hold` is set, HOLDING animations are included.
 ---
 ---Set `ignore_blending` to ignore animations that are currently blending.
+---@param hold? boolean
 ---@param ignore_blending? boolean
 ---@return Animation[]
-function AnimationAPI:getPlaying(ignore_blending) end
+function AnimationAPI:getPlaying(hold, ignore_blending) end
