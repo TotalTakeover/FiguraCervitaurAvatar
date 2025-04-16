@@ -383,7 +383,9 @@ local blendAnims = {
 
 -- Apply GS Blending
 for _, blend in ipairs(blendAnims) do
-	blend.anim:blendTime(table.unpack(blend.ticks)):blendCurve("easeOutQuad")
+	if blend.anim ~= nil then
+		blend.anim:blendTime(table.unpack(blend.ticks)):blendCurve("easeOutQuad")
+	end
 end
 
 -- If you're choosing to edit this script, don't put anything beneath the return line
