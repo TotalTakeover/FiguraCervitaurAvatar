@@ -1,5 +1,5 @@
 # [Cervitaur](https://github.com/Taurs-with-Keyboards/FiguraCervitaurAvatar)
-### Version: v1.1.1
+### Version: 1.1.1
 This Figura avatar is a template designed around turning the user into a Cervitaur.
 
 ### Authors:
